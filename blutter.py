@@ -164,7 +164,18 @@ def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     has_compressed_ptrs = 'compressed-pointers' in flags
     return DartLibInfo(dart_version, os_name, arch, has_compressed_ptrs, snapshot_hash)
 
+def newest_mtime(directory: str):
+    return max(os.path.getmtime(os.path.join(root, filename))
+               for root, _, filenames in os.walk(directory)
+               for filename in filenames)
+
 def build_and_run(input: BlutterInput):
+    blutter_dir = os.path.join(SCRIPT_DIR, 'blutter')
+    if os.path.isfile(input.blutter_file) and not input.rebuild_blutter \
+            and newest_mtime(blutter_dir) > os.path.getmtime(input.blutter_file):
+        print(f'Blutter source is newer than {input.blutter_file}, rebuilding')
+        input.rebuild_blutter = True
+
     if not os.path.isfile(input.blutter_file) or input.rebuild_blutter:
         # before fetch and build, check the existence of compiled library first
         #   so the src and build directories can be deleted
