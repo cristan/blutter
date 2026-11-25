@@ -170,6 +170,8 @@ void DartApp::LoadInfo()
 
 	finalizeFunctionsInfo();
 
+	loadCodeSizesFromInstructionsTable();
+
 	//auto fieldTable = isolate->field_table(); //contains only sentinel, null, false, 0
 
 	// there are instruction tables in vm isolate but their code are not called from Dart code (can be skipped)
@@ -617,6 +619,33 @@ void DartApp::finalizeFunctionsInfo()
 				dartFn->Signature().params.push_back(FnParam{ dtype, std::move(name), isRequired });
 			}
 		}
+	}
+}
+
+void DartApp::loadCodeSizesFromInstructionsTable()
+{
+	auto store = dart::Isolate::Current()->group()->object_store();
+	const auto& tables = dart::GrowableObjectArray::Handle(store->instructions_tables());
+	if (tables.IsNull())
+		return;
+
+	std::unordered_map<uint64_t, int64_t> sizeByEntryPoint;
+	auto& table = dart::InstructionsTable::Handle();
+	for (intptr_t i = 0; i < tables.Length(); i++) {
+		table = dart::InstructionsTable::RawCast(tables.At(i));
+		const auto rodata = table.rodata();
+		for (uint32_t entryIndex = 0; entryIndex + 1 < rodata->length; entryIndex++) {
+			const auto ep = table.EntryPointAt(entryIndex) - base();
+			sizeByEntryPoint[ep] = (int64_t)(table.EntryPointAt(entryIndex + 1) - table.EntryPointAt(entryIndex));
+		}
+	}
+
+	for (auto& [_, dartFn] : functions) {
+		if (dartFn->Size() > 0)
+			continue;
+		auto it = sizeByEntryPoint.find(dartFn->Address());
+		if (it != sizeByEntryPoint.end())
+			dartFn->SetPayload(dartFn->Address(), it->second);
 	}
 }
 

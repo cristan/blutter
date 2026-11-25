@@ -82,6 +82,8 @@ public:
 	std::vector<FnParam>& Params() { return signature.Params(); }
 	FnParam& Param(int i) { return signature.Param(i); }
 
+	void SetPayload(uint64_t payloadAddr, int64_t payloadSize) { payload_addr = payloadAddr; size = payloadSize; }
+
 	void SetAnalyzedData(std::unique_ptr<AnalyzedFnData> data);
 	AnalyzedFnData* GetAnalyzedData() { return analyzedData.get(); }
 
