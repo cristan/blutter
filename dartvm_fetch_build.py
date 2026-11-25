@@ -152,8 +152,17 @@ def cmake_dart(info: DartLibInfo, target_dir: str):
     # Note: pointer compression feature is set from Flutter and no one change it when building app.
     #       so only one build of Dart runtime is enough
     builddir = os.path.join(BUILD_DIR, info.lib_name)
-    subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DTARGET_OS={info.os_name}', f'-DTARGET_ARCH={info.arch}', 
-        f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'], 
+    icu_extra = []
+    icu_root = os.environ.get('ICU_ROOT')
+    if icu_root:
+        icu_extra = [
+            f'-DICU_ROOT={icu_root}',
+            f'-DICU_INCLUDE_DIR={icu_root}/include',
+            f'-DICU_UC_LIBRARY={icu_root}/lib/libicuuc.dylib',
+            f'-DICU_DATA_LIBRARY={icu_root}/lib/libicudata.dylib',
+        ]
+    subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DTARGET_OS={info.os_name}', f'-DTARGET_ARCH={info.arch}',
+        f'-DCOMPRESSED_PTRS={1 if info.has_compressed_ptrs else 0}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE', *icu_extra],
         cwd=target_dir, check=True)
     
     # build and install dart vm library to packages directory
