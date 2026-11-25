@@ -19,7 +19,7 @@ public:
 	std::string ObjectToString(dart::Object& obj, bool simpleForm = false, bool nestedObj = false, int depth = 0);
 
 private:
-	std::string getPoolObjectDescription(intptr_t offset, bool simpleForm = true);
+	std::string getPoolObjectDescription(intptr_t offset, bool simpleForm = true, bool nestedObj = false);
 
 	std::string dumpInstance(dart::Object& obj, bool simpleForm = false, bool nestedObj = false, int depth = 0);
 	std::string dumpInstanceFields(dart::Object& obj, DartClass& dartCls, intptr_t ptr, intptr_t offset, bool simpleForm = false, bool nestedObj = false, int depth = 0);
