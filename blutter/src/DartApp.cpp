@@ -380,24 +380,29 @@ void DartApp::addFunction(uintptr_t ep_addr, const dart::Function& func)
 
 class HeapCodeVisitor : public dart::ObjectVisitor {
 public:
-	explicit HeapCodeVisitor(std::vector<dart::CodePtr>& codePtrs) : codePtrs(codePtrs) {}
+	HeapCodeVisitor(std::vector<dart::CodePtr>& codePtrs, std::vector<dart::FunctionPtr>& funcPtrs)
+		: codePtrs(codePtrs), funcPtrs(funcPtrs) {}
 	virtual ~HeapCodeVisitor() {}
 
 	// Invoked for each object.
 	virtual void VisitObject(dart::ObjectPtr obj) {
 		if (obj->IsCode())
 			codePtrs.push_back(dart::Code::RawCast(obj));
+		else if (obj->IsFunction())
+			funcPtrs.push_back(dart::Function::RawCast(obj));
 	}
 
 private:
 	std::vector<dart::CodePtr>& codePtrs;
+	std::vector<dart::FunctionPtr>& funcPtrs;
 };
 
 void DartApp::findFunctionInHeap()
 {
 	std::vector<dart::CodePtr> codePtrs;
+	std::vector<dart::FunctionPtr> funcPtrs;
 	dart::HeapIterationScope heap_iteration_scope(dart::Thread::Current());
-	HeapCodeVisitor visitor(codePtrs);
+	HeapCodeVisitor visitor(codePtrs, funcPtrs);
 	heap_iteration_scope.IterateOldObjects(&visitor);
 
 	auto zone = dart::Thread::Current()->zone();
@@ -508,6 +513,26 @@ void DartApp::findFunctionInHeap()
 			std::cout << "  !!! Unhandle case. Please report with your APK\n";
 			//throw std::runtime_error(msg);
 		}
+	}
+
+	// Implicit field accessors and field initializers are reachable in the heap but
+	// absent from Class::functions(), and their instructions share image pages with no
+	// owning Code object, so neither the Code scan above nor the library walk reaches
+	// them. Register the ones that carry code, so a field read only through its own
+	// accessor or initializer still resolves to a named function.
+	auto& func = dart::Function::Handle(zone);
+	for (dart::FunctionPtr func_ptr : funcPtrs) {
+		func = func_ptr;
+		if (!(func.IsImplicitGetterOrSetter() || func.IsFieldInitializer()) || !func.HasCode())
+			continue;
+		const auto ep_offset = func.entry_point() - base();
+		if (functions.contains(ep_offset) || stubs.contains(ep_offset))
+			continue;
+		const auto owner_cid = func.Owner().untag()->id();
+		if (!dart::ClassTable::IsTopLevelCid(owner_cid) &&
+			(owner_cid < 0 || (size_t)owner_cid >= classes.size() || classes[owner_cid] == nullptr))
+			continue;
+		addFunction(ep_offset, func);
 	}
 }
 
