@@ -188,12 +188,16 @@ function getDartTypedArrayValues(ptr, cls, elementSize, readValFn) {
     return vals;
 }
 
+let funcPtrMap = null;
+
 function getDartClosure(ptr, cls) {
     let ep = ptr.add(cls.epOffset).readPointer();
     let fnName = 'unknown';
     if (libapp !== null) {
-        let offset = ep.sub(libapp);
-        fnName = 'fn_' + offset.toString(16);
+        if (funcPtrMap === null)
+            funcPtrMap = GetFuncPtrMap();
+        let offset = ep.sub(libapp).toInt32();
+        fnName = funcPtrMap.get(offset) || ('fn_' + offset.toString(16));
     }
     return `Closure(${fnName})`;
 }
