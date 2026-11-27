@@ -125,6 +125,17 @@ DartFunction::DartFunction(DartClass& cls, const dart::Code& code)
 	name = "__unknown_function__";
 }
 
+DartFunction::DartFunction(DartClass& cls, uint64_t epOffset, uint64_t sz)
+	: DartFnBase(), cls(cls), parent(nullptr), ptr(dart::Function::null()), kind(NORMAL),
+	is_native(true), is_closure(false), is_ffi(false), is_static(false), is_const(false), is_abstract(false), is_async(false)
+{
+	payload_addr = epOffset;
+	morphic_addr = epOffset;
+	size = sz;
+	ep_addr = epOffset;
+	name = "__unknown_function__";
+}
+
 std::string DartFunction::FullName() const
 {
 	auto& lib = cls.Library();
@@ -200,7 +211,10 @@ void DartFunction::PrintHead(std::ostream& of) const
 	auto& func = dart::Function::Handle(zone, ptr);
 
 	// Note: Signature is not dropped in aot when any named parameter is required. (from Function::IsRequiredAt() body)
-	const auto& sig = dart::FunctionType::Handle(zone, func.signature());
+	// Code recovered from the instructions table has no Function object to read a signature from.
+	auto& sig = dart::FunctionType::Handle(zone);
+	if (ptr != dart::Function::null())
+		sig = func.signature();
 
 	of << "  "; // indentation
 	if (is_closure)

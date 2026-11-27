@@ -44,6 +44,8 @@ public:
 	explicit DartFunction(DartClass& cls, const dart::FunctionPtr ptr);
 	// for creating naked code (only used for obfuscated app)
 	explicit DartFunction(DartClass& cls, const dart::Code& code);
+	// for code listed only in the instructions table, whose Code object was dropped
+	explicit DartFunction(DartClass& cls, uint64_t epOffset, uint64_t sz);
 	DartFunction() = delete;
 	DartFunction(const DartFunction&) = delete;
 	DartFunction(DartFunction&&) = delete;

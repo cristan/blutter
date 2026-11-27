@@ -24,6 +24,7 @@ public:
 
 	DartFunction* AddFunction(const dart::ObjectPtr funcPtr);
 	DartFunction* AddFunction(const dart::Code& code);
+	DartFunction* AddFunction(uint64_t epOffset, uint64_t sz);
 	DartField* AddField(const dart::ObjectPtr fieldPtr);
 	DartField* AddField(intptr_t offset, DartAbstractType* type, bool nativeNumber = false);
 	DartField* FindField(intptr_t offset);

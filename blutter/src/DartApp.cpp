@@ -655,13 +655,17 @@ void DartApp::loadCodeSizesFromInstructionsTable()
 		return;
 
 	std::unordered_map<uint64_t, int64_t> sizeByEntryPoint;
+	std::vector<std::pair<uint64_t, int64_t>> discardedEntries;
 	auto& table = dart::InstructionsTable::Handle();
 	for (intptr_t i = 0; i < tables.Length(); i++) {
 		table = dart::InstructionsTable::RawCast(tables.At(i));
 		const auto rodata = table.rodata();
 		for (uint32_t entryIndex = 0; entryIndex + 1 < rodata->length; entryIndex++) {
-			const auto ep = table.EntryPointAt(entryIndex) - base();
-			sizeByEntryPoint[ep] = (int64_t)(table.EntryPointAt(entryIndex + 1) - table.EntryPointAt(entryIndex));
+			const auto epOffset = table.EntryPointAt(entryIndex) - base();
+			const auto size = (int64_t)(table.EntryPointAt(entryIndex + 1) - table.EntryPointAt(entryIndex));
+			sizeByEntryPoint[epOffset] = size;
+			if (entryIndex < rodata->first_entry_with_code)
+				discardedEntries.emplace_back(epOffset, size);
 		}
 	}
 
@@ -671,6 +675,40 @@ void DartApp::loadCodeSizesFromInstructionsTable()
 		auto it = sizeByEntryPoint.find(dartFn->Address());
 		if (it != sizeByEntryPoint.end())
 			dartFn->SetPayload(dartFn->Address(), it->second);
+	}
+
+	// A bare-instructions snapshot drops the Code object of a function that is only ever called
+	// directly (a static, a closure, a private helper), so the heap scan, which finds a function
+	// through its Code object, never reaches it. The instructions table lists these before
+	// first_entry_with_code; the entries from there on keep their Code and were already found.
+	std::vector<uint64_t> knownEntryPoints;
+	knownEntryPoints.reserve(functions.size() + stubs.size());
+	for (const auto& [addr, _] : functions)
+		knownEntryPoints.push_back(addr);
+	for (const auto& [addr, _] : stubs)
+		knownEntryPoints.push_back(addr);
+	std::sort(knownEntryPoints.begin(), knownEntryPoints.end());
+
+	// discardedEntries interleaves entries from different instruction tables
+	std::sort(discardedEntries.begin(), discardedEntries.end());
+	DartLibrary* recoveredLib = nullptr;
+	for (const auto& [epOffset, size] : discardedEntries) {
+		// The heap scan may already have this function through its Function object, which it keys
+		// at the entry point -- a few bytes into the instructions, past the monomorphic check. Skip
+		// an entry whose range covers a known entry point so the named function keeps its place.
+		const auto knownAtOrAfter = std::lower_bound(knownEntryPoints.begin(), knownEntryPoints.end(), epOffset);
+		if (knownAtOrAfter != knownEntryPoints.end() && *knownAtOrAfter < epOffset + (uint64_t)size)
+			continue;
+		if (recoveredLib == nullptr) {
+			recoveredLib = new DartLibrary((intptr_t)0xdeadc0de);
+			recoveredLib->isInternal = false;
+			recoveredLib->url = "recovered";
+			recoveredLib->topClass = new DartClass(*recoveredLib);
+			recoveredLib->classes.push_back(recoveredLib->topClass);
+			libs.push_back(recoveredLib);
+		}
+		auto dartFn = recoveredLib->topClass->AddFunction(epOffset, (uint64_t)size);
+		functions[dartFn->Address()] = dartFn;
 	}
 }
 
