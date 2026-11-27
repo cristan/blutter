@@ -354,9 +354,6 @@ std::string TrackAndHint(ILInstr* il, RegConstMap& regConst)
 {
 	std::string hint;
 
-	// LoadValueInstr and StoreObjectPoolInstr share ILKind::LoadValue. The virtual
-	// tells them apart without RTTI: StoreObjectPool loads no register and returns an
-	// unset one, so it never reaches the switch as a LoadValueInstr.
 	const auto loaded = il->GetRegisterLoad();
 	if (loaded.reg.IsSet()) {
 		Forget(regConst, loaded.reg);
@@ -365,95 +362,22 @@ std::string TrackAndHint(ILInstr* il, RegConstMap& regConst)
 		return hint;
 	}
 
-	switch (il->Kind()) {
-	case ILInstr::MoveReg: {
+	if (il->Kind() == ILInstr::MoveReg) {
 		auto* ins = static_cast<MoveRegInstr*>(il);
 		const auto it = regConst.find((int)ins->srcReg);
 		if (it != regConst.end())
 			regConst[(int)ins->dstReg] = it->second;
 		else
 			Forget(regConst, ins->dstReg);
-		break;
+		return hint;
 	}
-	case ILInstr::StoreField:
-		AppendKnownValue(regConst, static_cast<StoreFieldInstr*>(il)->valReg, hint);
-		break;
-	case ILInstr::StoreArrayElement:
-		AppendKnownValue(regConst, static_cast<StoreArrayElementInstr*>(il)->valReg, hint);
-		break;
-	case ILInstr::WriteBarrier:
-		AppendKnownValue(regConst, static_cast<WriteBarrierInstr*>(il)->valReg, hint);
-		break;
-	case ILInstr::BranchIfSmi:
-		AppendKnownValue(regConst, static_cast<BranchIfSmiInstr*>(il)->objReg, hint);
-		break;
-	case ILInstr::TestType:
-		AppendKnownValue(regConst, static_cast<TestTypeInstr*>(il)->srcReg, hint);
-		break;
-	case ILInstr::LoadField: {
-		auto* ins = static_cast<LoadFieldInstr*>(il);
-		AppendKnownValue(regConst, ins->objReg, hint);
-		Forget(regConst, ins->dstReg);
-		break;
-	}
-	case ILInstr::LoadClassId: {
-		auto* ins = static_cast<LoadClassIdInstr*>(il);
-		AppendKnownValue(regConst, ins->objReg, hint);
-		Forget(regConst, ins->cidReg);
-		break;
-	}
-	case ILInstr::LoadTaggedClassIdMayBeSmi: {
-		auto* ins = static_cast<LoadTaggedClassIdMayBeSmiInstr*>(il);
-		AppendKnownValue(regConst, ins->objReg, hint);
-		Forget(regConst, ins->taggedCidReg);
-		break;
-	}
-	case ILInstr::LoadArrayElement: {
-		auto* ins = static_cast<LoadArrayElementInstr*>(il);
-		AppendKnownValue(regConst, ins->arrReg, hint);
-		Forget(regConst, ins->dstReg);
-		break;
-	}
-	// Inline boxing allocates a Mint and clobbers a scratch register, so drop every
-	// tracked value after reading the boxed source.
-	case ILInstr::BoxInt64:
-		AppendKnownValue(regConst, static_cast<BoxInt64Instr*>(il)->srcReg, hint);
+
+	const auto effect = il->ForwardingEffect();
+	AppendKnownValue(regConst, effect.read, hint);
+	if (effect.clobbersAll)
 		regConst.clear();
-		break;
-	case ILInstr::LoadInt32: {
-		auto* ins = static_cast<LoadInt32Instr*>(il);
-		AppendKnownValue(regConst, ins->srcObjReg, hint);
-		Forget(regConst, ins->dstReg);
-		break;
-	}
-	// Inline allocation clobbers a scratch register that may hold a tracked constant.
-	case ILInstr::AllocateObject:
-		regConst.clear();
-		break;
-	// A call does not preserve caller-saved registers, so drop every tracked value.
-	case ILInstr::Call:
-	case ILInstr::ClosureCall:
-	case ILInstr::GdtCall:
-	case ILInstr::CallLeafRuntime:
-		regConst.clear();
-		break;
-	// Instructions that define no tracked register (incl. StoreObjectPool, which lands
-	// here through its shared kind): leave the tracked constants unchanged.
-	case ILInstr::LoadValue:
-	case ILInstr::EnterFrame:
-	case ILInstr::LeaveFrame:
-	case ILInstr::AllocateStack:
-	case ILInstr::CheckStackOverflow:
-	case ILInstr::SaveRegister:
-	case ILInstr::Return:
-		break;
-	// Anything else may define a register we are tracking (including an Unknown
-	// instruction, whose own output is not printed); forget everything so a stale
-	// constant is never shown at a later read.
-	default:
-		regConst.clear();
-		break;
-	}
+	else
+		Forget(regConst, effect.written);
 
 	return hint.empty() ? hint : "  ; " + hint;
 }
