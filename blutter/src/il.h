@@ -6,6 +6,14 @@
 struct AsmText;
 struct FnParams;
 
+// The register an instruction loads a value into, with that value. Used to carry a
+// constant forward to later reads of the register so a use site can show the value.
+// An instruction that loads no value leaves the register unset.
+struct RegisterLoad {
+	A64::Register reg;
+	VarValue* value;
+};
+
 class ILInstr {
 public:
 	enum ILKind {
@@ -49,6 +57,10 @@ public:
 	virtual ~ILInstr() {}
 
 	virtual std::string ToString() = 0;
+	// The value this instruction loads into a register, when it loads one. The base
+	// returns an unset register; LoadValueInstr overrides it. Used so StoreObjectPool,
+	// which shares ILKind::LoadValue, is told apart without RTTI.
+	virtual RegisterLoad GetRegisterLoad() const { return { A64::Register{}, nullptr }; }
 	ILKind Kind() const { return kind; }
 	uint64_t Start() const { return addrRange.start; }
 	uint64_t End() const { return addrRange.end; }
@@ -178,6 +190,8 @@ public:
 	VarItem& GetValue() {
 		return val;
 	}
+
+	virtual RegisterLoad GetRegisterLoad() const { return { dstReg, val.Value() }; }
 
 	A64::Register dstReg;
 	VarItem val;

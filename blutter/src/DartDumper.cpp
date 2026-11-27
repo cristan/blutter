@@ -7,9 +7,11 @@
 #include <iostream>
 #include <sstream>
 #include <numeric>
+#include <unordered_map>
 #include "Disassembler.h"
 #include "DartThreadInfo.h"
 #include "CodeAnalyzer.h"
+#include "il.h"
 
 // TODO: move arm64 specific code to *_arm64 file
 
@@ -299,6 +301,165 @@ const std::string& DartDumper::getQuoteString(dart::Object& obj)
 	return txt;
 }
 
+namespace {
+
+// Forward a compile-time constant from where it is loaded into a register to where
+// that register is read, so a use site shows the value instead of a bare register
+// name. Keyed by A64::Register's integer value; reset per function.
+using RegConstMap = std::unordered_map<int, std::string>;
+
+// Only genuine compile-time constants are forwarded. A runtime value (parameter,
+// computed expression, instance) is left as its register name and is never shown as
+// if it were fixed.
+bool IsForwardableConstant(VarValue* value)
+{
+	if (value == nullptr || !value->HasValue())
+		return false;
+	switch (value->RawTypeId()) {
+	case dart::kStringCid:
+	case dart::kBoolCid:
+	case dart::kNullCid:
+	case dart::kIntegerCid:
+	case dart::kDoubleCid:
+	case dart::kTypeCid:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void AppendKnownValue(const RegConstMap& regConst, A64::Register reg, std::string& hint)
+{
+	if (!reg.IsSet())
+		return;
+	const auto it = regConst.find((int)reg);
+	if (it == regConst.end())
+		return;
+	if (!hint.empty())
+		hint += ", ";
+	hint += std::format("{} = {}", reg.Name(), it->second);
+}
+
+void Forget(RegConstMap& regConst, A64::Register reg)
+{
+	if (reg.IsSet())
+		regConst.erase((int)reg);
+}
+
+// Advance the register-constant tracking by one instruction and return the value
+// hint for a use that reads a tracked register (empty otherwise). A read is resolved
+// against the state before this instruction, so an instruction that both reads and
+// writes a register shows the incoming value.
+std::string TrackAndHint(ILInstr* il, RegConstMap& regConst)
+{
+	std::string hint;
+
+	// LoadValueInstr and StoreObjectPoolInstr share ILKind::LoadValue. The virtual
+	// tells them apart without RTTI: StoreObjectPool loads no register and returns an
+	// unset one, so it never reaches the switch as a LoadValueInstr.
+	const auto loaded = il->GetRegisterLoad();
+	if (loaded.reg.IsSet()) {
+		Forget(regConst, loaded.reg);
+		if (IsForwardableConstant(loaded.value))
+			regConst[(int)loaded.reg] = loaded.value->ToString();
+		return hint;
+	}
+
+	switch (il->Kind()) {
+	case ILInstr::MoveReg: {
+		auto* ins = static_cast<MoveRegInstr*>(il);
+		const auto it = regConst.find((int)ins->srcReg);
+		if (it != regConst.end())
+			regConst[(int)ins->dstReg] = it->second;
+		else
+			Forget(regConst, ins->dstReg);
+		break;
+	}
+	case ILInstr::StoreField:
+		AppendKnownValue(regConst, static_cast<StoreFieldInstr*>(il)->valReg, hint);
+		break;
+	case ILInstr::StoreArrayElement:
+		AppendKnownValue(regConst, static_cast<StoreArrayElementInstr*>(il)->valReg, hint);
+		break;
+	case ILInstr::WriteBarrier:
+		AppendKnownValue(regConst, static_cast<WriteBarrierInstr*>(il)->valReg, hint);
+		break;
+	case ILInstr::BranchIfSmi:
+		AppendKnownValue(regConst, static_cast<BranchIfSmiInstr*>(il)->objReg, hint);
+		break;
+	case ILInstr::TestType:
+		AppendKnownValue(regConst, static_cast<TestTypeInstr*>(il)->srcReg, hint);
+		break;
+	case ILInstr::LoadField: {
+		auto* ins = static_cast<LoadFieldInstr*>(il);
+		AppendKnownValue(regConst, ins->objReg, hint);
+		Forget(regConst, ins->dstReg);
+		break;
+	}
+	case ILInstr::LoadClassId: {
+		auto* ins = static_cast<LoadClassIdInstr*>(il);
+		AppendKnownValue(regConst, ins->objReg, hint);
+		Forget(regConst, ins->cidReg);
+		break;
+	}
+	case ILInstr::LoadTaggedClassIdMayBeSmi: {
+		auto* ins = static_cast<LoadTaggedClassIdMayBeSmiInstr*>(il);
+		AppendKnownValue(regConst, ins->objReg, hint);
+		Forget(regConst, ins->taggedCidReg);
+		break;
+	}
+	case ILInstr::LoadArrayElement: {
+		auto* ins = static_cast<LoadArrayElementInstr*>(il);
+		AppendKnownValue(regConst, ins->arrReg, hint);
+		Forget(regConst, ins->dstReg);
+		break;
+	}
+	// Inline boxing allocates a Mint and clobbers a scratch register, so drop every
+	// tracked value after reading the boxed source.
+	case ILInstr::BoxInt64:
+		AppendKnownValue(regConst, static_cast<BoxInt64Instr*>(il)->srcReg, hint);
+		regConst.clear();
+		break;
+	case ILInstr::LoadInt32: {
+		auto* ins = static_cast<LoadInt32Instr*>(il);
+		AppendKnownValue(regConst, ins->srcObjReg, hint);
+		Forget(regConst, ins->dstReg);
+		break;
+	}
+	// Inline allocation clobbers a scratch register that may hold a tracked constant.
+	case ILInstr::AllocateObject:
+		regConst.clear();
+		break;
+	// A call does not preserve caller-saved registers, so drop every tracked value.
+	case ILInstr::Call:
+	case ILInstr::ClosureCall:
+	case ILInstr::GdtCall:
+	case ILInstr::CallLeafRuntime:
+		regConst.clear();
+		break;
+	// Instructions that define no tracked register (incl. StoreObjectPool, which lands
+	// here through its shared kind): leave the tracked constants unchanged.
+	case ILInstr::LoadValue:
+	case ILInstr::EnterFrame:
+	case ILInstr::LeaveFrame:
+	case ILInstr::AllocateStack:
+	case ILInstr::CheckStackOverflow:
+	case ILInstr::SaveRegister:
+	case ILInstr::Return:
+		break;
+	// Anything else may define a register we are tracking (including an Unknown
+	// instruction, whose own output is not printed); forget everything so a stale
+	// constant is never shown at a later read.
+	default:
+		regConst.clear();
+		break;
+	}
+
+	return hint.empty() ? hint : "  ; " + hint;
+}
+
+} // namespace
+
 void DartDumper::DumpCode(const char* out_dir)
 {
 	std::filesystem::create_directory(out_dir);
@@ -334,6 +495,7 @@ void DartDumper::DumpCode(const char* out_dir)
 					auto& il_insns = dartFn->GetAnalyzedData()->il_insns;
 					auto il_itr = il_insns.begin();
 					AddrRange range;
+					RegConstMap regConst;
 					ASSERT(!asmTexts.empty());
 					for (auto& asmText : asmTexts) {
 						std::string extra;
@@ -368,15 +530,17 @@ void DartDumper::DumpCode(const char* out_dir)
 						}
 						else {
 							while ((*il_itr)->Start() < asmText.addr) {
+								const auto hint = TrackAndHint((*il_itr).get(), regConst);
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
-									of << std::format("{:#x}: {}\n", (*il_itr)->Start(), (*il_itr)->ToString());
+									of << std::format("{:#x}: {}{}\n", (*il_itr)->Start(), (*il_itr)->ToString(), hint);
 									of << "    // ";
 								}
 								++il_itr;
 							}
 							if ((*il_itr)->Start() == asmText.addr) {
+								const auto hint = TrackAndHint((*il_itr).get(), regConst);
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
-									of << std::format("{:#x}: {}\n", asmText.addr, (*il_itr)->ToString());
+									of << std::format("{:#x}: {}{}\n", asmText.addr, (*il_itr)->ToString(), hint);
 									of << "    //     ";
 									range = (*il_itr)->Range();
 								}
