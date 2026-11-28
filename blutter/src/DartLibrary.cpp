@@ -68,9 +68,8 @@ std::string DartLibrary::GetName()
 		out = url.substr(offset + 1);
 	}
 	else {
-		// expect "dart:*"
 		out = url;
-		out[4] = '_';
+		std::replace(out.begin(), out.end(), ':', '_');
 	}
 
 	if (out.ends_with(".dart"))
