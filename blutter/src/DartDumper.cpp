@@ -831,7 +831,7 @@ std::string DartDumper::dumpInstanceFields(dart::Object& obj, DartClass& dartCls
 	return ss.str();
 }
 
-std::string DartDumper::getPoolObjectDescription(intptr_t offset, bool simpleForm)
+std::string DartDumper::getPoolObjectDescription(intptr_t offset, bool simpleForm, bool nestedObj)
 {
 	const auto& pool = app.GetObjectPool();
 	intptr_t idx = dart::ObjectPool::IndexFromOffset(offset);
@@ -855,10 +855,10 @@ std::string DartDumper::getPoolObjectDescription(intptr_t offset, bool simpleFor
 			else {
 				ASSERT(unlinkTargetType == dart::ObjectPool::EntryType::kTaggedObject);
 				auto& obj2 = dart::Object::Handle(pool.ObjectAt(idx + 1));
-				return std::format("[pp+{:#x}] UnlinkedCall: {}", offset, ObjectToString(obj2, simpleForm));
+				return std::format("[pp+{:#x}] UnlinkedCall: {}", offset, ObjectToString(obj2, simpleForm, nestedObj));
 			}
 		}
-		return std::format("[pp+{:#x}] {}", offset, ObjectToString(obj, simpleForm));
+		return std::format("[pp+{:#x}] {}", offset, ObjectToString(obj, simpleForm, nestedObj));
 	}
 	else if (objType == dart::ObjectPool::EntryType::kImmediate) {
 		dart::uword imm = pool.RawValueAt(idx);
@@ -901,7 +901,7 @@ void DartDumper::DumpObjectPool(const char* filename)
 		// offset here is from ObjectPool pointer subtracted by kHeapObjectTag
 		// add 1 to make the offset value same as offset in compiled code
 		intptr_t offset = dart::ObjectPool::OffsetFromIndex(i);
-		auto txt = getPoolObjectDescription(offset + 1, false);
+		auto txt = getPoolObjectDescription(offset + 1, false, true);
 		of << txt << "\n";
 		if (txt.compare(txt.find(']'), 15, "] UnlinkedCall:") == 0)
 			i++;
