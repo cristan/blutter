@@ -170,6 +170,8 @@ void DartApp::LoadInfo()
 
 	finalizeFunctionsInfo();
 
+	loadCodeSizesFromInstructionsTable();
+
 	//auto fieldTable = isolate->field_table(); //contains only sentinel, null, false, 0
 
 	// there are instruction tables in vm isolate but their code are not called from Dart code (can be skipped)
@@ -378,24 +380,29 @@ void DartApp::addFunction(uintptr_t ep_addr, const dart::Function& func)
 
 class HeapCodeVisitor : public dart::ObjectVisitor {
 public:
-	explicit HeapCodeVisitor(std::vector<dart::CodePtr>& codePtrs) : codePtrs(codePtrs) {}
+	HeapCodeVisitor(std::vector<dart::CodePtr>& codePtrs, std::vector<dart::FunctionPtr>& funcPtrs)
+		: codePtrs(codePtrs), funcPtrs(funcPtrs) {}
 	virtual ~HeapCodeVisitor() {}
 
 	// Invoked for each object.
 	virtual void VisitObject(dart::ObjectPtr obj) {
 		if (obj->IsCode())
 			codePtrs.push_back(dart::Code::RawCast(obj));
+		else if (obj->IsFunction())
+			funcPtrs.push_back(dart::Function::RawCast(obj));
 	}
 
 private:
 	std::vector<dart::CodePtr>& codePtrs;
+	std::vector<dart::FunctionPtr>& funcPtrs;
 };
 
 void DartApp::findFunctionInHeap()
 {
 	std::vector<dart::CodePtr> codePtrs;
+	std::vector<dart::FunctionPtr> funcPtrs;
 	dart::HeapIterationScope heap_iteration_scope(dart::Thread::Current());
-	HeapCodeVisitor visitor(codePtrs);
+	HeapCodeVisitor visitor(codePtrs, funcPtrs);
 	heap_iteration_scope.IterateOldObjects(&visitor);
 
 	auto zone = dart::Thread::Current()->zone();
@@ -507,6 +514,26 @@ void DartApp::findFunctionInHeap()
 			//throw std::runtime_error(msg);
 		}
 	}
+
+	// Implicit field accessors and field initializers are reachable in the heap but
+	// absent from Class::functions(), and their instructions share image pages with no
+	// owning Code object, so neither the Code scan above nor the library walk reaches
+	// them. Register the ones that carry code, so a field read only through its own
+	// accessor or initializer still resolves to a named function.
+	auto& func = dart::Function::Handle(zone);
+	for (dart::FunctionPtr func_ptr : funcPtrs) {
+		func = func_ptr;
+		if (!(func.IsImplicitGetterOrSetter() || func.IsFieldInitializer()) || !func.HasCode())
+			continue;
+		const auto ep_offset = func.entry_point() - base();
+		if (functions.contains(ep_offset) || stubs.contains(ep_offset))
+			continue;
+		const auto owner_cid = func.Owner().untag()->id();
+		if (!dart::ClassTable::IsTopLevelCid(owner_cid) &&
+			(owner_cid < 0 || (size_t)owner_cid >= classes.size() || classes[owner_cid] == nullptr))
+			continue;
+		addFunction(ep_offset, func);
+	}
 }
 
 void DartApp::finalizeFunctionsInfo()
@@ -617,6 +644,33 @@ void DartApp::finalizeFunctionsInfo()
 				dartFn->Signature().params.push_back(FnParam{ dtype, std::move(name), isRequired });
 			}
 		}
+	}
+}
+
+void DartApp::loadCodeSizesFromInstructionsTable()
+{
+	auto store = dart::Isolate::Current()->group()->object_store();
+	const auto& tables = dart::GrowableObjectArray::Handle(store->instructions_tables());
+	if (tables.IsNull())
+		return;
+
+	std::unordered_map<uint64_t, int64_t> sizeByEntryPoint;
+	auto& table = dart::InstructionsTable::Handle();
+	for (intptr_t i = 0; i < tables.Length(); i++) {
+		table = dart::InstructionsTable::RawCast(tables.At(i));
+		const auto rodata = table.rodata();
+		for (uint32_t entryIndex = 0; entryIndex + 1 < rodata->length; entryIndex++) {
+			const auto ep = table.EntryPointAt(entryIndex) - base();
+			sizeByEntryPoint[ep] = (int64_t)(table.EntryPointAt(entryIndex + 1) - table.EntryPointAt(entryIndex));
+		}
+	}
+
+	for (auto& [_, dartFn] : functions) {
+		if (dartFn->Size() > 0)
+			continue;
+		auto it = sizeByEntryPoint.find(dartFn->Address());
+		if (it != sizeByEntryPoint.end())
+			dartFn->SetPayload(dartFn->Address(), it->second);
 	}
 }
 

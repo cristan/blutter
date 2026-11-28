@@ -40,6 +40,7 @@ private:
 	void addFunction(uintptr_t ep_addr, const dart::Function& func);
 	void findFunctionInHeap();
 	void finalizeFunctionsInfo();
+	void loadCodeSizesFromInstructionsTable();
 	void loadFromObjectPool();
 	void walkObject(dart::Object& obj); // to check field types from existed object
 
