@@ -74,7 +74,11 @@ pip3 install pyelftools requests
 ```
 
 ## Usage
-Extract "lib" directory from apk file
+Run against an apk file:
+```
+python3 blutter.py path/to/app.apk out_dir
+```
+Or against a directory that contains both libapp.so and libflutter.so, such as the "lib/arm64-v8a" directory extracted from an apk:
 ```
 python3 blutter.py path/to/app/lib/arm64-v8a out_dir
 ```
@@ -154,4 +158,4 @@ python blutter.py path\to\lib\arm64-v8a build\vs --vs-sln
   - Object modification
 - Obfuscated app (still missing many functions)
 - Reading iOS binary
-- Input as apk or ipa
+- Input as ipa
