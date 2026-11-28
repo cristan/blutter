@@ -386,18 +386,19 @@ std::string TrackAndHint(ILInstr* il, RegConstMap& regConst)
 // Fold an AllocateArray + its element stores back into the literal it builds, keyed by
 // the call address of what consumes the array: a _StringBase::_interpolate call for a
 // string interpolation 'a${v1}b', a Map._fromLiteral call for a map literal {'a': v1},
-// or the AllocateArray itself for a list literal ['a', v1, 'b']. A compile-time string
-// element keeps its text; any other element is a runtime value, shown as ${vN} inside an
-// interpolation and vN inside a list or map.
+// or the AllocateArray itself for a list literal ['a', v1, 'b']. A string element keeps
+// its text; an int, bool, double or null element keeps its Dart literal in a list or map;
+// a runtime element is vN in a list or map. An interpolation shows every non-string
+// element as ${vN}.
 //
-// A string constant is tracked per register and dropped when another value overwrites
-// that register, so a register reused after its load is not read as the string it no
-// longer holds. The array is the register its first element store writes; stores to it are
+// A constant is tracked per register and dropped when another value overwrites that
+// register, so a register reused after its load is not read as the constant it no longer
+// holds. The array is the register its first element store writes; stores to it are
 // collected, both the array-element stores and the field stores at an element offset
 // that the element naming did not recognise as array accesses. A literal is emitted
 // only when the captured count matches the allocated length, so a build whose array is
 // spilled to a second register, or an element written twice, is left out rather than
-// shown truncated or doubled. A list literal also needs at least one string element, so
+// shown truncated or doubled. A list literal also needs at least one constant element, so
 // an array of only runtime values is not labelled with a row of placeholders.
 static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const std::vector<std::unique_ptr<ILInstr>>& il_insns)
 {
@@ -417,6 +418,7 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 
 	std::unordered_map<uint64_t, std::string> result;
 	std::unordered_map<int, std::string> regStr;
+	std::unordered_map<int, std::string> regConst;
 	int64_t pendingLenSmi = -1;
 
 	bool building = false;
@@ -425,16 +427,23 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 	int arrReg = -1;
 	uint64_t allocAddr = 0;
 	std::map<int, std::string> elems;
+	std::set<int> stringIdx;
 	std::set<int> runtimeIdx;
-	auto reset = [&]() { building = false; dirty = false; arrLen = -1; arrReg = -1; allocAddr = 0; elems.clear(); runtimeIdx.clear(); };
+	auto reset = [&]() { building = false; dirty = false; arrLen = -1; arrReg = -1; allocAddr = 0; elems.clear(); stringIdx.clear(); runtimeIdx.clear(); };
 
+	// Split each element into a string constant (kept raw for interpolation), another
+	// compile-time constant (an int, bool, double or null, kept as its Dart literal), or
+	// a runtime value.
 	auto record = [&](int idx, int valReg) {
 		if (idx < 0 || (arrLen >= 0 && idx >= arrLen) || elems.contains(idx)) {
 			dirty = true;
 			return;
 		}
-		const auto it = regStr.find(valReg);
-		if (it != regStr.end())
+		if (const auto it = regStr.find(valReg); it != regStr.end()) {
+			elems[idx] = it->second;
+			stringIdx.insert(idx);
+		}
+		else if (const auto it = regConst.find(valReg); it != regConst.end())
 			elems[idx] = it->second;
 		else {
 			elems[idx] = std::string();
@@ -447,7 +456,9 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 	};
 	auto allRuntime = [&]() { return runtimeIdx.size() == elems.size(); };
 	auto fmtValue = [&](int idx, int& runtime) -> std::string {
-		return runtimeIdx.contains(idx) ? ("v" + std::to_string(++runtime)) : ("'" + elems.at(idx) + "'");
+		if (runtimeIdx.contains(idx))
+			return "v" + std::to_string(++runtime);
+		return stringIdx.contains(idx) ? ("'" + elems.at(idx) + "'") : elems.at(idx);
 	};
 
 	// A build that reaches another AllocateArray or the function's end without an
@@ -502,6 +513,7 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 					arrLen = (int)(pendingLenSmi >> dart::kSmiTagSize);
 				pendingLenSmi = -1;
 				regStr.clear();
+				regConst.clear();
 				continue;
 			}
 			if (name == "_interpolate") {
@@ -509,11 +521,12 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 					std::string tmpl;
 					int runtime = 0;
 					for (const auto& [idx, piece] : elems)
-						tmpl += runtimeIdx.contains(idx) ? ("${v" + std::to_string(++runtime) + "}") : piece;
+						tmpl += stringIdx.contains(idx) ? piece : ("${v" + std::to_string(++runtime) + "}");
 					result[il->Start()] = "'" + tmpl + "'";
 				}
 				reset();
 				regStr.clear();
+				regConst.clear();
 				continue;
 			}
 			// A map literal passes the array of alternating key, value elements to this.
@@ -531,6 +544,7 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 				}
 				reset();
 				regStr.clear();
+				regConst.clear();
 				continue;
 			}
 		}
@@ -539,27 +553,41 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 		if (loaded.reg.IsSet()) {
 			const int reg = (int)loaded.reg;
 			regStr.erase(reg);
-			const bool isString = loaded.value != nullptr && loaded.value->RawTypeId() == dart::kStringCid;
-			const bool isInt = loaded.value != nullptr && loaded.value->RawTypeId() == dart::kIntegerCid;
-			if (isString)
+			regConst.erase(reg);
+			const auto cid = loaded.value != nullptr ? loaded.value->RawTypeId() : dart::kIllegalCid;
+			if (cid == dart::kStringCid)
 				regStr[reg] = escape(reinterpret_cast<VarString*>(loaded.value)->str);
+			else if (cid == dart::kNullCid)
+				regConst[reg] = "null";
+			else if (cid == dart::kBoolCid || cid == dart::kIntegerCid)
+				regConst[reg] = loaded.value->ToString();
+			else if (cid == dart::kDoubleCid) {
+				auto text = std::format("{}", reinterpret_cast<VarDouble*>(loaded.value)->val);
+				if (text.find_first_of(".eE") == std::string::npos && !text.empty() && text.back() >= '0' && text.back() <= '9')
+					text += ".0";
+				regConst[reg] = text;
+			}
 			if (reg == arrLengthReg)
-				pendingLenSmi = isInt ? reinterpret_cast<VarInteger*>(loaded.value)->val : -1;
+				pendingLenSmi = cid == dart::kIntegerCid ? reinterpret_cast<VarInteger*>(loaded.value)->val : -1;
 			continue;
 		}
 		if (kind == ILInstr::MoveReg) {
 			auto* mv = static_cast<MoveRegInstr*>(il);
 			const int src = (int)mv->srcReg, dst = (int)mv->dstReg;
 			if (const auto it = regStr.find(src); it != regStr.end()) regStr[dst] = it->second; else regStr.erase(dst);
+			if (const auto it = regConst.find(src); it != regConst.end()) regConst[dst] = it->second; else regConst.erase(dst);
 			if (dst == arrLengthReg)
 				pendingLenSmi = -1;
 			continue;
 		}
 		const auto effect = il->ForwardingEffect();
-		if (effect.clobbersAll)
+		if (effect.clobbersAll) {
 			regStr.clear();
+			regConst.clear();
+		}
 		else if (effect.written.IsSet()) {
 			regStr.erase((int)effect.written);
+			regConst.erase((int)effect.written);
 			if ((int)effect.written == arrLengthReg)
 				pendingLenSmi = -1;
 		}
