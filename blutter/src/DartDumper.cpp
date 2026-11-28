@@ -385,9 +385,10 @@ std::string TrackAndHint(ILInstr* il, RegConstMap& regConst)
 
 // Fold an AllocateArray + its element stores back into the literal it builds, keyed by
 // the call address of what consumes the array: a _StringBase::_interpolate call for a
-// string interpolation 'a${v1}b', or the AllocateArray itself for a list literal
-// ['a', v1, 'b']. A compile-time string element keeps its text; any other element is a
-// runtime value, shown as ${vN} inside an interpolation and vN inside a list.
+// string interpolation 'a${v1}b', a Map._fromLiteral call for a map literal {'a': v1},
+// or the AllocateArray itself for a list literal ['a', v1, 'b']. A compile-time string
+// element keeps its text; any other element is a runtime value, shown as ${vN} inside an
+// interpolation and vN inside a list or map.
 //
 // A string constant is tracked per register and dropped when another value overwrites
 // that register, so a register reused after its load is not read as the string it no
@@ -445,6 +446,9 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 		return building && !dirty && arrLen > 0 && (int)elems.size() == arrLen;
 	};
 	auto allRuntime = [&]() { return runtimeIdx.size() == elems.size(); };
+	auto fmtValue = [&](int idx, int& runtime) -> std::string {
+		return runtimeIdx.contains(idx) ? ("v" + std::to_string(++runtime)) : ("'" + elems.at(idx) + "'");
+	};
 
 	// A build that reaches another AllocateArray or the function's end without an
 	// _interpolate is a list literal.
@@ -457,7 +461,7 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 		for (const auto& [idx, piece] : elems) {
 			out += first ? "" : ", ";
 			first = false;
-			out += runtimeIdx.contains(idx) ? ("v" + std::to_string(++runtime)) : ("'" + piece + "'");
+			out += fmtValue(idx, runtime);
 		}
 		result[allocAddr] = out + "]";
 	};
@@ -507,6 +511,23 @@ static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const 
 					for (const auto& [idx, piece] : elems)
 						tmpl += runtimeIdx.contains(idx) ? ("${v" + std::to_string(++runtime) + "}") : piece;
 					result[il->Start()] = "'" + tmpl + "'";
+				}
+				reset();
+				regStr.clear();
+				continue;
+			}
+			// A map literal passes the array of alternating key, value elements to this.
+			if (name == "Map._fromLiteral") {
+				if (isComplete() && arrLen % 2 == 0 && !allRuntime()) {
+					std::string out = "{";
+					int runtime = 0;
+					for (int i = 0; i < arrLen; i += 2) {
+						out += i == 0 ? "" : ", ";
+						const std::string key = fmtValue(i, runtime);
+						const std::string value = fmtValue(i + 1, runtime);
+						out += key + ": " + value;
+					}
+					result[il->Start()] = out + "}";
 				}
 				reset();
 				regStr.clear();
