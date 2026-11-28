@@ -9,9 +9,11 @@
 #include <sstream>
 #include <numeric>
 #include <unordered_set>
+#include <unordered_map>
 #include "Disassembler.h"
 #include "DartThreadInfo.h"
 #include "CodeAnalyzer.h"
+#include "il.h"
 
 // TODO: move arm64 specific code to *_arm64 file
 
@@ -319,6 +321,89 @@ static std::string casePattern(const std::string& text)
 	return pattern;
 }
 
+namespace {
+
+// Forward a compile-time constant from where it is loaded into a register to where
+// that register is read, so a use site shows the value instead of a bare register
+// name. Keyed by A64::Register's integer value; reset per function.
+using RegConstMap = std::unordered_map<int, std::string>;
+
+// Only genuine compile-time constants are forwarded. A runtime value (parameter,
+// computed expression, instance) is left as its register name and is never shown as
+// if it were fixed.
+bool IsForwardableConstant(VarValue* value)
+{
+	if (value == nullptr || !value->HasValue())
+		return false;
+	switch (value->RawTypeId()) {
+	case dart::kStringCid:
+	case dart::kBoolCid:
+	case dart::kNullCid:
+	case dart::kIntegerCid:
+	case dart::kDoubleCid:
+	case dart::kTypeCid:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void AppendKnownValue(const RegConstMap& regConst, A64::Register reg, std::string& hint)
+{
+	if (!reg.IsSet())
+		return;
+	const auto it = regConst.find((int)reg);
+	if (it == regConst.end())
+		return;
+	if (!hint.empty())
+		hint += ", ";
+	hint += std::format("{} = {}", reg.Name(), it->second);
+}
+
+void Forget(RegConstMap& regConst, A64::Register reg)
+{
+	if (reg.IsSet())
+		regConst.erase((int)reg);
+}
+
+// Advance the register-constant tracking by one instruction and return the value
+// hint for a use that reads a tracked register (empty otherwise). A read is resolved
+// against the state before this instruction, so an instruction that both reads and
+// writes a register shows the incoming value.
+std::string TrackAndHint(ILInstr* il, RegConstMap& regConst)
+{
+	std::string hint;
+
+	const auto loaded = il->GetRegisterLoad();
+	if (loaded.reg.IsSet()) {
+		Forget(regConst, loaded.reg);
+		if (IsForwardableConstant(loaded.value))
+			regConst[(int)loaded.reg] = loaded.value->ToString();
+		return hint;
+	}
+
+	if (il->Kind() == ILInstr::MoveReg) {
+		auto* ins = static_cast<MoveRegInstr*>(il);
+		const auto it = regConst.find((int)ins->srcReg);
+		if (it != regConst.end())
+			regConst[(int)ins->dstReg] = it->second;
+		else
+			Forget(regConst, ins->dstReg);
+		return hint;
+	}
+
+	const auto effect = il->ForwardingEffect();
+	AppendKnownValue(regConst, effect.read, hint);
+	if (effect.clobbersAll)
+		regConst.clear();
+	else
+		Forget(regConst, effect.written);
+
+	return hint.empty() ? hint : "  ; " + hint;
+}
+
+} // namespace
+
 void DartDumper::DumpCode(const char* out_dir)
 {
 	std::filesystem::create_directory(out_dir);
@@ -359,6 +444,7 @@ void DartDumper::DumpCode(const char* out_dir)
 					auto& il_insns = dartFn->GetAnalyzedData()->il_insns;
 					auto il_itr = il_insns.begin();
 					AddrRange range;
+					RegConstMap regConst;
 					ASSERT(!asmTexts.empty());
 					for (auto& asmText : asmTexts) {
 						std::string extra;
@@ -393,15 +479,17 @@ void DartDumper::DumpCode(const char* out_dir)
 						}
 						else {
 							while ((*il_itr)->Start() < asmText.addr) {
+								const auto hint = TrackAndHint((*il_itr).get(), regConst);
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
-									of << std::format("{:#x}: {}\n", (*il_itr)->Start(), (*il_itr)->ToString());
+									of << std::format("{:#x}: {}{}\n", (*il_itr)->Start(), (*il_itr)->ToString(), hint);
 									of << "    // ";
 								}
 								++il_itr;
 							}
 							if ((*il_itr)->Start() == asmText.addr) {
+								const auto hint = TrackAndHint((*il_itr).get(), regConst);
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
-									of << std::format("{:#x}: {}\n", asmText.addr, (*il_itr)->ToString());
+									of << std::format("{:#x}: {}{}\n", asmText.addr, (*il_itr)->ToString(), hint);
 									of << "    //     ";
 									range = (*il_itr)->Range();
 								}

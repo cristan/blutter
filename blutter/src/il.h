@@ -6,6 +6,24 @@
 struct AsmText;
 struct FnParams;
 
+// The register an instruction loads a value into, with that value. Used to carry a
+// constant forward to later reads of the register so a use site can show the value.
+// An instruction that loads no value leaves the register unset.
+struct RegisterLoad {
+	A64::Register reg;
+	VarValue* value;
+};
+
+// How an instruction affects the constants forwarded to a register's later reads: the
+// register whose value to show here (read), the register it overwrites so a stale value
+// is not carried on (written), and whether it may clobber registers unpredictably (a
+// call, an inline allocation).
+struct RegisterEffect {
+	A64::Register read;
+	A64::Register written;
+	bool clobbersAll;
+};
+
 class ILInstr {
 public:
 	enum ILKind {
@@ -49,6 +67,13 @@ public:
 	virtual ~ILInstr() {}
 
 	virtual std::string ToString() = 0;
+	// The value this instruction loads into a register, when it loads one. The base
+	// returns an unset register; LoadValueInstr overrides it. Used so StoreObjectPool,
+	// which shares ILKind::LoadValue, is told apart without RTTI.
+	virtual RegisterLoad GetRegisterLoad() const { return { A64::Register{}, nullptr }; }
+	// See RegisterEffect. Overridden by instructions that read, write, or preserve a
+	// register; the conservative default drops every tracked value.
+	virtual RegisterEffect ForwardingEffect() const { return { .clobbersAll = true }; }
 	ILKind Kind() const { return kind; }
 	uint64_t Start() const { return addrRange.start; }
 	uint64_t End() const { return addrRange.end; }
@@ -85,6 +110,8 @@ public:
 	EnterFrameInstr(EnterFrameInstr&&) = delete;
 	EnterFrameInstr& operator=(const EnterFrameInstr&) = delete;
 
+	virtual RegisterEffect ForwardingEffect() const { return { .clobbersAll = false }; }
+
 	virtual std::string ToString() {
 		return "EnterFrame";
 	}
@@ -97,6 +124,8 @@ public:
 	LeaveFrameInstr(LeaveFrameInstr&&) = delete;
 	LeaveFrameInstr& operator=(const LeaveFrameInstr&) = delete;
 
+	virtual RegisterEffect ForwardingEffect() const { return { .clobbersAll = false }; }
+
 	virtual std::string ToString() {
 		return "LeaveFrame";
 	}
@@ -108,6 +137,8 @@ public:
 	AllocateStackInstr() = delete;
 	AllocateStackInstr(AllocateStackInstr&&) = delete;
 	AllocateStackInstr& operator=(const AllocateStackInstr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .clobbersAll = false }; }
 
 	virtual std::string ToString() {
 		return std::format("AllocStack({:#x})", allocSize);
@@ -125,6 +156,8 @@ public:
 	CheckStackOverflowInstr() = delete;
 	CheckStackOverflowInstr(CheckStackOverflowInstr&&) = delete;
 	CheckStackOverflowInstr& operator=(const CheckStackOverflowInstr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .clobbersAll = false }; }
 
 	virtual std::string ToString() {
 		return "CheckStackOverflow";
@@ -179,6 +212,8 @@ public:
 		return val;
 	}
 
+	virtual RegisterLoad GetRegisterLoad() const { return { dstReg, val.Value() }; }
+
 	A64::Register dstReg;
 	VarItem val;
 };
@@ -189,6 +224,8 @@ public:
 	StoreObjectPoolInstr() = delete;
 	StoreObjectPoolInstr(StoreObjectPoolInstr&&) = delete;
 	StoreObjectPoolInstr& operator=(const StoreObjectPoolInstr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .clobbersAll = false }; }
 
 	virtual std::string ToString() {
 		return std::format("[PP+{:#x}] = {}", offset, srcReg.Name());
@@ -234,6 +271,8 @@ public:
 	SaveRegisterInstr() = delete;
 	SaveRegisterInstr(SaveRegisterInstr&&) = delete;
 	SaveRegisterInstr& operator=(const SaveRegisterInstr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .clobbersAll = false }; }
 
 	virtual std::string ToString() {
 		return std::string("SaveReg ") + srcReg.Name();
@@ -333,6 +372,8 @@ public:
 	ReturnInstr(ReturnInstr&&) = delete;
 	ReturnInstr& operator=(const ReturnInstr&) = delete;
 
+	virtual RegisterEffect ForwardingEffect() const { return { .clobbersAll = false }; }
+
 	virtual std::string ToString() {
 		return "ret";
 	}
@@ -344,6 +385,8 @@ public:
 	BranchIfSmiInstr() = delete;
 	BranchIfSmiInstr(BranchIfSmiInstr&&) = delete;
 	BranchIfSmiInstr& operator=(const BranchIfSmiInstr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .read = objReg }; }
 
 	virtual std::string ToString() {
 		return std::format("branchIfSmi({}, {:#x})", objReg.Name(), branchAddr);
@@ -359,6 +402,8 @@ public:
 	LoadClassIdInstr() = delete;
 	LoadClassIdInstr(LoadClassIdInstr&&) = delete;
 	LoadClassIdInstr& operator=(const LoadClassIdInstr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .read = objReg, .written = cidReg }; }
 
 	virtual std::string ToString() {
 		return std::format("{} = LoadClassIdInstr({})", cidReg.Name(), objReg.Name());
@@ -378,6 +423,8 @@ public:
 	LoadTaggedClassIdMayBeSmiInstr(LoadTaggedClassIdMayBeSmiInstr&&) = delete;
 	LoadTaggedClassIdMayBeSmiInstr& operator=(const LoadTaggedClassIdMayBeSmiInstr&) = delete;
 
+	virtual RegisterEffect ForwardingEffect() const { return { .read = objReg, .written = taggedCidReg }; }
+
 	virtual std::string ToString() {
 		return std::format("{} = LoadTaggedClassIdMayBeSmiInstr({})", taggedCidReg.Name(), objReg.Name());
 	}
@@ -396,6 +443,9 @@ public:
 	BoxInt64Instr(BoxInt64Instr&&) = delete;
 	BoxInt64Instr& operator=(const BoxInt64Instr&) = delete;
 
+	// Inline boxing allocates a Mint and clobbers a scratch register.
+	virtual RegisterEffect ForwardingEffect() const { return { .read = srcReg, .clobbersAll = true }; }
+
 	virtual std::string ToString() {
 		return std::format("{} = BoxInt64Instr({})", objReg.Name(), srcReg.Name());
 	}
@@ -410,6 +460,8 @@ public:
 	LoadInt32Instr() = delete;
 	LoadInt32Instr(LoadInt32Instr&&) = delete;
 	LoadInt32Instr& operator=(const LoadInt32Instr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .read = srcObjReg, .written = dstReg }; }
 
 	virtual std::string ToString() {
 		return std::format("{} = LoadInt32Instr({})", dstReg.Name(), srcObjReg.Name());
@@ -481,6 +533,8 @@ public:
 	LoadArrayElementInstr(LoadArrayElementInstr&&) = delete;
 	LoadArrayElementInstr& operator=(const LoadArrayElementInstr&) = delete;
 
+	virtual RegisterEffect ForwardingEffect() const { return { .read = arrReg, .written = dstReg }; }
+
 	virtual std::string ToString() {
 		return std::format("ArrayLoad: {} = {}[{}]  ; {}", dstReg.Name(), arrReg.Name(), idx.Name(), arrayOp.ToString());
 	}
@@ -498,6 +552,8 @@ public:
 	StoreArrayElementInstr() = delete;
 	StoreArrayElementInstr(StoreArrayElementInstr&&) = delete;
 	StoreArrayElementInstr& operator=(const StoreArrayElementInstr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .read = valReg }; }
 
 	virtual std::string ToString() {
 		return std::format("ArrayStore: {}[{}] = {}  ; {}", arrReg.Name(), idx.Name(), valReg.Name(), arrayOp.ToString());
@@ -517,6 +573,8 @@ public:
 	LoadFieldInstr(LoadFieldInstr&&) = delete;
 	LoadFieldInstr& operator=(const LoadFieldInstr&) = delete;
 
+	virtual RegisterEffect ForwardingEffect() const { return { .read = objReg, .written = dstReg }; }
+
 	virtual std::string ToString() {
 		return std::format("LoadField: {} = {}->field_{:x}", dstReg.Name(), objReg.Name(), offset);
 	}
@@ -535,6 +593,8 @@ public:
 	StoreFieldInstr() = delete;
 	StoreFieldInstr(StoreFieldInstr&&) = delete;
 	StoreFieldInstr& operator=(const StoreFieldInstr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .read = valReg }; }
 
 	virtual std::string ToString() {
 		return std::format("StoreField: {}->field_{:x} = {}", objReg.Name(), offset, valReg.Name());
@@ -609,6 +669,8 @@ public:
 	WriteBarrierInstr(WriteBarrierInstr&&) = delete;
 	WriteBarrierInstr& operator=(const WriteBarrierInstr&) = delete;
 
+	virtual RegisterEffect ForwardingEffect() const { return { .read = valReg }; }
+
 	virtual std::string ToString() {
 		return std::format("{}WriteBarrierInstr(obj = {}, val = {})", isArray ? "Array" : "", objReg.Name(), valReg.Name());
 	}
@@ -625,6 +687,8 @@ public:
 	TestTypeInstr() = delete;
 	TestTypeInstr(TestTypeInstr&&) = delete;
 	TestTypeInstr& operator=(const TestTypeInstr&) = delete;
+
+	virtual RegisterEffect ForwardingEffect() const { return { .read = srcReg }; }
 
 	virtual std::string ToString() {
 		return std::format("{} as {}", srcReg.Name(), typeName);
