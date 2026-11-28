@@ -3,6 +3,7 @@
 #include <fstream>
 #include <format>
 #include <set>
+#include <map>
 #include <ranges>
 #include <iostream>
 #include <sstream>
@@ -905,6 +906,53 @@ void DartDumper::DumpObjectPool(const char* filename)
 		of << txt << "\n";
 		if (txt.compare(txt.find(']'), 15, "] UnlinkedCall:") == 0)
 			i++;
+	}
+}
+
+void DartDumper::DumpObjectPoolXref(const char* filename)
+{
+	// pool slot offset (same value as in the code) -> loads, contiguous per function
+	std::map<intptr_t, std::vector<std::pair<DartFunction*, uint64_t>>> xrefs;
+
+	for (auto dartLib : app.libs) {
+		for (auto dartCls : dartLib->classes) {
+			for (auto dartFn : dartCls->Functions()) {
+				auto analyzed = dartFn->GetAnalyzedData();
+				if (analyzed == nullptr)
+					continue;
+				for (auto& asmText : analyzed->asmTexts.Data()) {
+					if (asmText.dataType == AsmText::PoolOffset)
+						xrefs[asmText.poolOffset].emplace_back(dartFn, asmText.addr);
+				}
+			}
+		}
+	}
+
+	std::ofstream of(filename);
+	of << "object pool cross-reference: each slot is followed by the functions that load it\n";
+	of << "only slots loaded by at least one analyzed function are listed\n";
+	of << "a string assembled at runtime is not a single slot and does not appear here\n\n";
+
+	for (const auto& [offset, refs] : xrefs) {
+		auto preview = getPoolObjectDescription(offset, true);
+		constexpr size_t kMaxPreview = 120;
+		if (preview.length() > kMaxPreview)
+			preview = preview.substr(0, kMaxPreview) + "...";
+		of << preview << "\n";
+
+		DartFunction* lastFn = nullptr;
+		for (const auto& [fn, codeAddr] : refs) {
+			if (fn != lastFn) {
+				if (lastFn != nullptr)
+					of << "\n";
+				of << std::format("    {} (fn={:#x}) at {:#x}", fn->FullName(), fn->Address(), codeAddr);
+				lastFn = fn;
+			}
+			else {
+				of << std::format(", {:#x}", codeAddr);
+			}
+		}
+		of << "\n\n";
 	}
 }
 

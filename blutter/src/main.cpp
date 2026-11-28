@@ -46,6 +46,9 @@ int main(int argc, char** argv)
 		dumper.DumpObjectPool((outDir / "pp.txt").string().c_str());
 		dumper.DumpObjects((outDir / "objs.txt").string().c_str());
 #ifndef NO_CODE_ANALYSIS
+		dumper.DumpObjectPoolXref((outDir / "pp_xref.txt").string().c_str());
+#endif
+#ifndef NO_CODE_ANALYSIS
 		std::cout << "Generating application assemblies\n";
 #else
 		std::cout << "Generating application functions in asm folder\n";

@@ -14,6 +14,7 @@ public:
 	void DumpCode(const char* out_dir);
 
 	void DumpObjectPool(const char* filename);
+	void DumpObjectPoolXref(const char* filename);
 	void DumpObjects(const char* filename);
 
 	std::string ObjectToString(dart::Object& obj, bool simpleForm = false, bool nestedObj = false, int depth = 0);
