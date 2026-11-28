@@ -383,19 +383,22 @@ std::string TrackAndHint(ILInstr* il, RegConstMap& regConst)
 	return hint.empty() ? hint : "  ; " + hint;
 }
 
-// Fold an AllocateArray + its element stores + _StringBase::_interpolate back into
-// the string interpolation literal it builds, keyed by the _interpolate call address.
-// A compile-time string element keeps its text; any other element becomes ${vN}.
+// Fold an AllocateArray + its element stores back into the literal it builds, keyed by
+// the call address of what consumes the array: a _StringBase::_interpolate call for a
+// string interpolation 'a${v1}b', or the AllocateArray itself for a list literal
+// ['a', v1, 'b']. A compile-time string element keeps its text; any other element is a
+// runtime value, shown as ${vN} inside an interpolation and vN inside a list.
 //
 // A string constant is tracked per register and dropped when another value overwrites
 // that register, so a register reused after its load is not read as the string it no
 // longer holds. The array is the register its first element store writes; stores to it are
 // collected, both the array-element stores and the field stores at an element offset
-// that the element naming did not recognise as array accesses. The literal is emitted
+// that the element naming did not recognise as array accesses. A literal is emitted
 // only when the captured count matches the allocated length, so a build whose array is
 // spilled to a second register, or an element written twice, is left out rather than
-// shown truncated or doubled.
-static std::unordered_map<uint64_t, std::string> reconstructInterpolations(const std::vector<std::unique_ptr<ILInstr>>& il_insns)
+// shown truncated or doubled. A list literal also needs at least one string element, so
+// an array of only runtime values is not labelled with a row of placeholders.
+static std::unordered_map<uint64_t, std::string> reconstructArrayLiterals(const std::vector<std::unique_ptr<ILInstr>>& il_insns)
 {
 	auto escape = [](const std::string& s) {
 		std::string out;
@@ -419,9 +422,10 @@ static std::unordered_map<uint64_t, std::string> reconstructInterpolations(const
 	bool dirty = false;
 	int arrLen = -1;
 	int arrReg = -1;
+	uint64_t allocAddr = 0;
 	std::map<int, std::string> elems;
 	std::set<int> runtimeIdx;
-	auto reset = [&]() { building = false; dirty = false; arrLen = -1; arrReg = -1; elems.clear(); runtimeIdx.clear(); };
+	auto reset = [&]() { building = false; dirty = false; arrLen = -1; arrReg = -1; allocAddr = 0; elems.clear(); runtimeIdx.clear(); };
 
 	auto record = [&](int idx, int valReg) {
 		if (idx < 0 || (arrLen >= 0 && idx >= arrLen) || elems.contains(idx)) {
@@ -435,6 +439,27 @@ static std::unordered_map<uint64_t, std::string> reconstructInterpolations(const
 			elems[idx] = std::string();
 			runtimeIdx.insert(idx);
 		}
+	};
+
+	auto isComplete = [&]() {
+		return building && !dirty && arrLen > 0 && (int)elems.size() == arrLen;
+	};
+	auto allRuntime = [&]() { return runtimeIdx.size() == elems.size(); };
+
+	// A build that reaches another AllocateArray or the function's end without an
+	// _interpolate is a list literal.
+	auto emitListLiteral = [&]() {
+		if (!isComplete() || allRuntime())
+			return;
+		std::string out = "[";
+		int runtime = 0;
+		bool first = true;
+		for (const auto& [idx, piece] : elems) {
+			out += first ? "" : ", ";
+			first = false;
+			out += runtimeIdx.contains(idx) ? ("v" + std::to_string(++runtime)) : ("'" + piece + "'");
+		}
+		result[allocAddr] = out + "]";
 	};
 
 	for (const auto& ilp : il_insns) {
@@ -464,8 +489,10 @@ static std::unordered_map<uint64_t, std::string> reconstructInterpolations(const
 			auto* fn = static_cast<CallInstr*>(il)->GetFunction();
 			const auto name = fn != nullptr ? fn->Name() : std::string();
 			if (name == "AllocateArray") {
+				emitListLiteral();
 				reset();
 				building = true;
+				allocAddr = il->Start();
 				// AllocateArray takes the element count in R2 as a tagged Smi.
 				if (pendingLenSmi > 0 && (pendingLenSmi & ((int64_t{ 1 } << dart::kSmiTagSize) - 1)) == 0)
 					arrLen = (int)(pendingLenSmi >> dart::kSmiTagSize);
@@ -474,8 +501,7 @@ static std::unordered_map<uint64_t, std::string> reconstructInterpolations(const
 				continue;
 			}
 			if (name == "_interpolate") {
-				const int n = (int)elems.size();
-				if (building && !dirty && arrLen > 0 && n == arrLen) {
+				if (isComplete()) {
 					std::string tmpl;
 					int runtime = 0;
 					for (const auto& [idx, piece] : elems)
@@ -517,6 +543,7 @@ static std::unordered_map<uint64_t, std::string> reconstructInterpolations(const
 				pendingLenSmi = -1;
 		}
 	}
+	emitListLiteral();
 	return result;
 }
 
@@ -555,10 +582,10 @@ void DartDumper::DumpCode(const char* out_dir)
 				if (dartFn->Size() > 0) {
 					auto& asmTexts = dartFn->GetAnalyzedData()->asmTexts.Data();
 					auto& il_insns = dartFn->GetAnalyzedData()->il_insns;
-					const auto interp = reconstructInterpolations(il_insns);
-					const auto interpOf = [&](uint64_t a) -> std::string {
-						const auto it = interp.find(a);
-						return it != interp.end() ? "  // => " + it->second : std::string();
+					const auto literals = reconstructArrayLiterals(il_insns);
+					const auto literalOf = [&](uint64_t a) -> std::string {
+						const auto it = literals.find(a);
+						return it != literals.end() ? "  // => " + it->second : std::string();
 					};
 					auto il_itr = il_insns.begin();
 					AddrRange range;
@@ -599,7 +626,7 @@ void DartDumper::DumpCode(const char* out_dir)
 							while ((*il_itr)->Start() < asmText.addr) {
 								const auto hint = TrackAndHint((*il_itr).get(), regConst);
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
-									of << std::format("{:#x}: {}{}{}\n", (*il_itr)->Start(), (*il_itr)->ToString(), hint, interpOf((*il_itr)->Start()));
+									of << std::format("{:#x}: {}{}{}\n", (*il_itr)->Start(), (*il_itr)->ToString(), hint, literalOf((*il_itr)->Start()));
 									of << "    // ";
 								}
 								++il_itr;
@@ -607,7 +634,7 @@ void DartDumper::DumpCode(const char* out_dir)
 							if ((*il_itr)->Start() == asmText.addr) {
 								const auto hint = TrackAndHint((*il_itr).get(), regConst);
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
-									of << std::format("{:#x}: {}{}{}\n", asmText.addr, (*il_itr)->ToString(), hint, interpOf(asmText.addr));
+									of << std::format("{:#x}: {}{}{}\n", asmText.addr, (*il_itr)->ToString(), hint, literalOf(asmText.addr));
 									of << "    //     ";
 									range = (*il_itr)->Range();
 								}
