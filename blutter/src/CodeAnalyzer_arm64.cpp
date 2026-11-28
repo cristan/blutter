@@ -3762,9 +3762,10 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 			if (!arrayOp.IsArrayOp())
 				return nullptr;
 			const auto idxShiftVal = arrayOp.SizeLog2();
-			if (arrayOp.arrType == ArrayOp::List) {
-				// Uint8List or Int32x4
-				// do nothing for now
+			if (arrayOp.arrType == ArrayOp::List || arrayOp.arrType == ArrayOp::Unknown) {
+				// A register index is the shape of an array access; a shift that matches no
+				// known element size (a SIMD lane) still leaves it one, so take it without
+				// the shift check.
 			}
 			else if (shift.value == idxShiftVal) {
 				// nothing to do
@@ -3905,6 +3906,19 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 					payload_offset = typedPayload;
 				}
 				else if (op.arrType == ArrayOp::List) {
+					// The displacement coincides with an Array's payload, but a compressed build
+					// puts a plain field at that same offset, and nothing here -- no allocation,
+					// no class-id guard -- proves this object is an Array. A fresh Array allocation
+					// is the one thing that does; without it, report the field that is actually
+					// there, except that the array write barrier on a store still names an element.
+					if (fresh != FreshAlloc::Array) {
+						if (op.isLoad)
+							return std::make_unique<LoadFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+						const auto il_wb = processWriteBarrierInstr(insn);
+						if (il_wb && il_wb->isArray)
+							return std::make_unique<StoreArrayElementInstr>(insn.Wrap(marker.Take()), valReg, objReg, VarStorage::NewSmallImm((offset - arrayPayload) / op.size), op);
+						return std::make_unique<StoreFieldInstr>(insn.Wrap(marker.Take()), valReg, objReg, offset);
+					}
 					payload_offset = arrayPayload;
 				}
 				else if (objRegIsPayload) {
