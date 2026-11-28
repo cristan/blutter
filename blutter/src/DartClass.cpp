@@ -161,6 +161,13 @@ DartFunction* DartClass::AddFunction(const dart::Code& code)
 	return dartFn;
 }
 
+DartFunction* DartClass::AddFunction(uint64_t epOffset, uint64_t sz)
+{
+	auto dartFn = new DartFunction(*this, epOffset, sz);
+	functions.push_back(dartFn);
+	return dartFn;
+}
+
 DartField* DartClass::AddField(const dart::ObjectPtr fieldPtr)
 {
 	auto dartField = new DartField(*this, dart::Field::RawCast(fieldPtr));
